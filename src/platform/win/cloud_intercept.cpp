@@ -1433,11 +1433,25 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                                     nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, oFlags);
                                 if (hReq) {
                                     for (auto& hdr : info.requestHeaders) {
+                                        // Skip headers that conflict with our inline body or that
+                                        // WinHTTP manages automatically from dwTotalLength.
+                                        if (hdr.size() >= 14 && _strnicmp(hdr.c_str(), "Content-Length", 14) == 0) continue;
+                                        if (hdr.size() >= 17 && _strnicmp(hdr.c_str(), "Transfer-Encoding", 17) == 0) continue;
                                         auto wHdr = HttpUtil::Widen(hdr);
-                                        WinHttpAddRequestHeaders(hReq, wHdr.c_str(), (DWORD)wHdr.size(), WINHTTP_ADDREQ_FLAG_ADD);
+                                        if (!WinHttpAddRequestHeaders(hReq, wHdr.c_str(), (DWORD)wHdr.size(), WINHTTP_ADDREQ_FLAG_ADD))
+                                            LOG("[SteamMirror] WinHttpAddRequestHeaders failed: %lu hdr=%.64s", GetLastError(), hdr.c_str());
                                     }
+                                    // Use WinHttpWriteData to stream the body instead of lpOptional
+                                    // to avoid ERROR_INVALID_PARAMETER (87) from inline-body/header conflicts.
                                     BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                        (LPVOID)blobData.data(), (DWORD)blobData.size(), (DWORD)blobData.size(), 0);
+                                        WINHTTP_NO_REQUEST_DATA, 0, (DWORD)blobData.size(), 0);
+                                    if (ok) {
+                                        DWORD written = 0;
+                                        ok = WinHttpWriteData(hReq, blobData.data(), (DWORD)blobData.size(), &written);
+                                        if (!ok) LOG("[SteamMirror] WinHttpWriteData failed: %lu for app=%u file=%s", GetLastError(), realAppId, cleanName.c_str());
+                                    } else {
+                                        LOG("[SteamMirror] WinHttpSendRequest failed: %lu for app=%u file=%s", GetLastError(), realAppId, cleanName.c_str());
+                                    }
                                     if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
                                     if (ok) {
                                         DWORD sc = 0, scLen = sizeof(sc);
@@ -1445,12 +1459,16 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                                             WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scLen, WINHTTP_NO_HEADER_INDEX);
                                         putOk = (sc >= 200 && sc < 300);
                                         LOG("[SteamMirror] PUT to Steam CDN: HTTP %lu for app=%u file=%s", sc, realAppId, cleanName.c_str());
-                                    } else {
-                                        LOG("[SteamMirror] WinHttpSendRequest/ReceiveResponse failed: %lu", GetLastError());
+                                    } else if (ok == FALSE) {
+                                        LOG("[SteamMirror] WinHttpReceiveResponse failed: %lu for app=%u file=%s", GetLastError(), realAppId, cleanName.c_str());
                                     }
                                     WinHttpCloseHandle(hReq);
+                                } else {
+                                    LOG("[SteamMirror] WinHttpOpenRequest failed: %lu for app=%u file=%s", GetLastError(), realAppId, cleanName.c_str());
                                 }
                                 WinHttpCloseHandle(hConn);
+                            } else {
+                                LOG("[SteamMirror] WinHttpConnect failed: %lu host=%s app=%u", GetLastError(), info.host.c_str(), realAppId);
                             }
                         }
                         if (putOk) {
