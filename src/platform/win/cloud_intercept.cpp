@@ -358,6 +358,48 @@ static std::unordered_map<uint32_t, time_t> g_launchTimes;
 static std::unordered_map<uint32_t, uint64_t> g_launchVdfPlaytime;
 static std::unordered_map<uint32_t, uint64_t> g_launchVdfPlaytime2wks;
 
+// Steam Cloud mirror: per-file upload CDN slots captured from Steam's BeginFileUpload response.
+// Key: "{appId}/{cleanFilename}", value: CDN upload info from Steam's block_requests.
+struct SteamUploadInfo {
+    std::string host;
+    std::string path;
+    bool useHttps = true;
+    std::vector<std::string> requestHeaders;
+};
+static std::mutex g_steamUploadMutex;
+static std::unordered_map<std::string, SteamUploadInfo> g_steamUploadSlots;
+
+// Steam Cloud mirror: map our batch IDs to Steam's batch IDs for CompleteBatch forwarding.
+static std::mutex g_steamBatchIdMutex;
+static std::unordered_map<uint64_t, uint64_t> g_ourToSteamBatchId;
+
+// Lazy singleton WinHTTP session used for PUT uploads to Steam CDN.
+static HINTERNET g_steamMirrorSession = nullptr;
+static std::once_flag g_steamMirrorSessionOnce;
+static HINTERNET GetSteamMirrorSession() {
+    std::call_once(g_steamMirrorSessionOnce, []() {
+        g_steamMirrorSession = WinHttpOpen(L"SteamCloud/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (g_steamMirrorSession)
+            WinHttpSetTimeouts(g_steamMirrorSession, 5000, 5000, 30000, 30000);
+    });
+    return g_steamMirrorSession;
+}
+
+// Strip a root token prefix ("%Token%/path") from a filename, matching StripRootToken in rpc_handlers.cpp.
+static std::string MirrorStripRootToken(const std::string& filename) {
+    if (filename.size() >= 2 && filename[0] == '%') {
+        size_t end = filename.find('%', 1);
+        if (end != std::string::npos && end + 1 < filename.size()) {
+            size_t start = end + 1;
+            while (start < filename.size() && (filename[start] == '\r' || filename[start] == '\n'))
+                ++start;
+            return filename.substr(start);
+        }
+    }
+    return filename;
+}
+
 static uint32_t ClampToUint32(uint64_t value) {
     return value > (std::numeric_limits<uint32_t>::max)()
         ? (std::numeric_limits<uint32_t>::max)()
@@ -1298,7 +1340,138 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     }
     auto& result = *dispatched;
 
-    LOG("[Slot4] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
+    // Steam Cloud mirror: for namespace apps, also upload to Steam Cloud.
+    // RPC_BEGIN_UPLOAD  → call original slot4 to get Steam CDN URL; store it keyed by cleanName.
+    // RPC_COMMIT_UPLOAD → PUT blob to stored CDN URL then forward CommitFileUpload to Steam.
+    // RPC_DELETE_FILE   → forward delete to Steam as well.
+    if (strcmp(methodName, RPC_BEGIN_UPLOAD) == 0) {
+        std::string rawFilename;
+        for (auto& f : innerFields)
+            if (f.fieldNum == 6 && f.wireType == PB::LengthDelimited)
+                rawFilename.assign(reinterpret_cast<const char*>(f.data), f.dataLen);
+        if (!rawFilename.empty()) {
+            // Forward to Steam CM; responseBody gets Steam's response with the CDN URL.
+            int sFlags[8] = {};
+            if (g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags)) {
+                auto sRespBytes = SerializeBodyToBytes(responseBody);
+                auto sRespFields = PB::Parse(sRespBytes.data(), sRespBytes.size());
+                auto* blockF = PB::FindField(sRespFields, 2); // block_requests submessage
+                if (blockF && blockF->wireType == PB::LengthDelimited) {
+                    auto blockFields = PB::Parse(blockF->data, blockF->dataLen);
+                    SteamUploadInfo info;
+                    for (auto& bf : blockFields) {
+                        if (bf.fieldNum == 1 && bf.wireType == PB::LengthDelimited)
+                            info.host.assign(reinterpret_cast<const char*>(bf.data), bf.dataLen);
+                        else if (bf.fieldNum == 2 && bf.wireType == PB::LengthDelimited)
+                            info.path.assign(reinterpret_cast<const char*>(bf.data), bf.dataLen);
+                        else if (bf.fieldNum == 3 && bf.wireType == PB::Varint)
+                            info.useHttps = (bf.varintVal != 0);
+                        else if (bf.fieldNum == 5 && bf.wireType == PB::LengthDelimited)
+                            info.requestHeaders.push_back(std::string(
+                                reinterpret_cast<const char*>(bf.data), bf.dataLen));
+                    }
+                    if (!info.host.empty() && !info.path.empty()) {
+                        std::string cleanName = MirrorStripRootToken(rawFilename);
+                        std::string key = std::to_string(realAppId) + "/" + cleanName;
+                        std::lock_guard<std::mutex> lk(g_steamUploadMutex);
+                        g_steamUploadSlots[key] = std::move(info);
+                        LOG("[SteamMirror] Stored CDN slot for app=%u file=%s", realAppId, cleanName.c_str());
+                    }
+                }
+            } else {
+                LOG("[SteamMirror] BeginFileUpload to Steam failed for app=%u; no CDN slot stored", realAppId);
+            }
+            // Restore our local response (overwrite Steam's response written above).
+        }
+    } else if (strcmp(methodName, RPC_COMMIT_UPLOAD) == 0) {
+        bool transferSucceeded = false;
+        std::string rawFilename;
+        for (auto& f : innerFields) {
+            if (f.fieldNum == 1 && f.wireType == PB::Varint) transferSucceeded = (f.varintVal != 0);
+            if (f.fieldNum == 4 && f.wireType == PB::LengthDelimited)
+                rawFilename.assign(reinterpret_cast<const char*>(f.data), f.dataLen);
+        }
+        bool localCommitted = false;
+        if (!result.body.Data().empty()) {
+            auto rbFields = PB::Parse(result.body.Data().data(), result.body.Size());
+            auto* rbF = PB::FindField(rbFields, 1);
+            localCommitted = (rbF != nullptr && rbF->varintVal != 0);
+        }
+        if (transferSucceeded && localCommitted && !rawFilename.empty()) {
+            std::string cleanName = MirrorStripRootToken(rawFilename);
+            std::string key = std::to_string(realAppId) + "/" + cleanName;
+            SteamUploadInfo info;
+            bool hasSlot = false;
+            {
+                std::lock_guard<std::mutex> lk(g_steamUploadMutex);
+                auto it = g_steamUploadSlots.find(key);
+                if (it != g_steamUploadSlots.end()) {
+                    info = std::move(it->second);
+                    g_steamUploadSlots.erase(it);
+                    hasSlot = true;
+                }
+            }
+            if (hasSlot) {
+                uint32_t mirrorAcctId = GetAccountId();
+                if (mirrorAcctId != 0) {
+                    auto blobData = HttpServer::ReadBlob(mirrorAcctId, realAppId, cleanName);
+                    if (!blobData.empty()) {
+                        bool putOk = false;
+                        HINTERNET hSession = GetSteamMirrorSession();
+                        if (hSession) {
+                            auto wHost = FileUtil::Utf8ToPath(info.host).wstring();
+                            INTERNET_PORT port = info.useHttps ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+                            HINTERNET hConn = WinHttpConnect(hSession, wHost.c_str(), port, 0);
+                            if (hConn) {
+                                auto wPath = FileUtil::Utf8ToPath(info.path).wstring();
+                                DWORD oFlags = info.useHttps ? (WINHTTP_FLAG_SECURE | WINHTTP_FLAG_ESCAPE_DISABLE) : WINHTTP_FLAG_ESCAPE_DISABLE;
+                                HINTERNET hReq = WinHttpOpenRequest(hConn, L"PUT", wPath.c_str(),
+                                    nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, oFlags);
+                                if (hReq) {
+                                    for (auto& hdr : info.requestHeaders) {
+                                        auto wHdr = FileUtil::Utf8ToPath(hdr).wstring();
+                                        WinHttpAddRequestHeaders(hReq, wHdr.c_str(), (DWORD)wHdr.size(), WINHTTP_ADDREQ_FLAG_ADD);
+                                    }
+                                    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                        (LPVOID)blobData.data(), (DWORD)blobData.size(), (DWORD)blobData.size(), 0);
+                                    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+                                    if (ok) {
+                                        DWORD sc = 0, scLen = sizeof(sc);
+                                        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                            WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scLen, WINHTTP_NO_HEADER_INDEX);
+                                        putOk = (sc >= 200 && sc < 300);
+                                        LOG("[SteamMirror] PUT to Steam CDN: HTTP %lu for app=%u file=%s", sc, realAppId, cleanName.c_str());
+                                    } else {
+                                        LOG("[SteamMirror] WinHttpSendRequest/ReceiveResponse failed: %lu", GetLastError());
+                                    }
+                                    WinHttpCloseHandle(hReq);
+                                }
+                                WinHttpCloseHandle(hConn);
+                            }
+                        }
+                        if (putOk) {
+                            int sFlags[8] = {};
+                            g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags);
+                            LOG("[SteamMirror] CommitFileUpload forwarded to Steam for app=%u file=%s", realAppId, cleanName.c_str());
+                        } else {
+                            LOG("[SteamMirror] PUT failed; skipping Steam CommitFileUpload for app=%u file=%s", realAppId, cleanName.c_str());
+                        }
+                    } else {
+                        LOG("[SteamMirror] No blob data for app=%u file=%s; skipping Steam upload", realAppId, cleanName.c_str());
+                    }
+                }
+            }
+        }
+        // Restore our local response (overwrite Steam's response if CommitFileUpload was forwarded).
+    } else if (strcmp(methodName, RPC_DELETE_FILE) == 0) {
+        // Forward delete to Steam Cloud as well.
+        int sFlags[8] = {};
+        if (g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags))
+            LOG("[SteamMirror] DeleteFile forwarded to Steam for app=%u", realAppId);
+        else
+            LOG("[SteamMirror] DeleteFile to Steam failed for app=%u", realAppId);
+        // Restore our local response (overwrite Steam's response).
+    }
 
     // Write the response body into the response protobuf object
     if (responseBody && result.body.Size() > 0) {
@@ -1459,6 +1632,65 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
     auto& result = *dispatched;
+
+    // Steam Cloud mirror: forward BeginBatch/CompleteBatch to Steam so its change-number advances.
+    if (strcmp(methodName, RPC_BEGIN_BATCH) == 0) {
+        // Capture our batchId from the local result before g_originalSlot5 overwrites the response.
+        uint64_t ourBatchId = 0;
+        {
+            auto tmpFields = PB::Parse(result.body.Data().data(), result.body.Size());
+            auto* f = PB::FindField(tmpFields, 1);
+            if (f) ourBatchId = f->varintVal;
+        }
+        if (g_originalSlot5(thisptr, methodName, request, response, flags)) {
+            void* sRespBody = *(void**)((uintptr_t)response + 48);
+            if (sRespBody && ourBatchId != 0) {
+                auto sRespBytes = SerializeBodyToBytes(sRespBody);
+                auto sRespFields = PB::Parse(sRespBytes.data(), sRespBytes.size());
+                auto* sBidF = PB::FindField(sRespFields, 1);
+                if (sBidF) {
+                    std::lock_guard<std::mutex> lk(g_steamBatchIdMutex);
+                    g_ourToSteamBatchId[ourBatchId] = sBidF->varintVal;
+                    LOG("[SteamMirror] BeginBatch: ourBatchId=%llu steamBatchId=%llu", ourBatchId, sBidF->varintVal);
+                }
+            }
+        } else {
+            LOG("[SteamMirror] BeginBatch forwarding to Steam failed for app=%u", realAppId);
+        }
+        // Fall through; our result will overwrite Steam's response below.
+    } else if (strcmp(methodName, RPC_COMPLETE_BATCH) == 0) {
+        auto batchInfo = CloudRpcUtils::ParseCompleteBatchRequest(innerFields);
+        uint64_t steamBatchId = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_steamBatchIdMutex);
+            auto it = g_ourToSteamBatchId.find(batchInfo.batchId);
+            if (it != g_ourToSteamBatchId.end()) {
+                steamBatchId = it->second;
+                g_ourToSteamBatchId.erase(it);
+            }
+        }
+        if (steamBatchId != 0) {
+            // Rewrite the request body with Steam's batchId, call original, then restore.
+            void* reqBodyObj = *(void**)((uintptr_t)request + 48);
+            PB::Writer steamReq;
+            for (auto& f : innerFields) {
+                if (f.fieldNum == 2 && f.wireType == PB::Varint)
+                    steamReq.WriteVarint(2, steamBatchId);
+                else if (f.wireType == PB::Varint)
+                    steamReq.WriteVarint(f.fieldNum, f.varintVal);
+                else if (f.wireType == PB::LengthDelimited)
+                    steamReq.WriteBytes(f.fieldNum, f.data, f.dataLen);
+            }
+            ParseBytesToBody(reqBodyObj, steamReq.Data().data(), steamReq.Size());
+            if (g_originalSlot5(thisptr, methodName, request, response, flags))
+                LOG("[SteamMirror] CompleteBatch forwarded to Steam for app=%u steamBatchId=%llu", realAppId, steamBatchId);
+            else
+                LOG("[SteamMirror] CompleteBatch to Steam failed for app=%u", realAppId);
+            // Restore original request body so LocalStorage/CloudStorage don't see corrupted state.
+            ParseBytesToBody(reqBodyObj, reqBytes.data(), reqBytes.size());
+        }
+        // Fall through; our result will overwrite Steam's response below.
+    }
 
     LOG("[VtHook] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
 
@@ -2653,26 +2885,6 @@ static bool IsValidLuaFilename(const std::string& name) {
     return true;
 }
 
-// Matches "<digits>.<digits>" sentinel filenames (e.g., "8870.1531967859").
-static bool IsValidMarkerFilename(const std::string& name) {
-    auto dot = name.rfind('.');
-    if (dot == 0 || dot == std::string::npos || dot == name.size() - 1) return false;
-    if (name.find('.') != dot) return false;
-    for (size_t i = 0; i < dot; ++i)
-        if (name[i] < '0' || name[i] > '9') return false;
-    for (size_t i = dot + 1; i < name.size(); ++i)
-        if (name[i] < '0' || name[i] > '9') return false;
-    return true;
-}
-
-// Check if <pluginBase><appId>.<accountId> sentinel file exists.
-static bool IsOwnedMarker(const std::string& pluginBase, uint32_t appId, uint32_t accountId) {
-    if (!accountId) return false;
-    std::string markerPath = pluginBase + std::to_string(appId) + "." + std::to_string(accountId);
-    DWORD attrs = GetFileAttributesW(FileUtil::Utf8ToPath(markerPath).c_str());
-    return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
-}
-
 // Reject binary content (NUL bytes in the first 8KB)
 static bool IsValidLuaContent(const uint8_t* data, size_t len) {
     size_t check = (len < 8192) ? len : 8192;
@@ -2718,27 +2930,6 @@ static std::vector<LuaFile> ReadLocalLuaFiles() {
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
 
-    // Scan sentinel files (<digits>.<digits>)
-    {
-        std::wstring markerPattern = dirWide + L"*.*";
-        WIN32_FIND_DATAW mfd;
-        HANDLE hMark = FindFirstFileW(markerPattern.c_str(), &mfd);
-        if (hMark != INVALID_HANDLE_VALUE) {
-            do {
-                std::string name = FileUtil::WideToUtf8(mfd.cFileName);
-                if (name.empty() || !IsValidMarkerFilename(name)) continue;
-                LuaFile lf;
-                lf.filename = name;
-                lf.content = {};
-                ULARGE_INTEGER uli;
-                uli.LowPart  = mfd.ftLastWriteTime.dwLowDateTime;
-                uli.HighPart = mfd.ftLastWriteTime.dwHighDateTime;
-                lf.modTime = (uli.QuadPart - 116444736000000000ULL) / 10000000ULL;
-                files.push_back(std::move(lf));
-            } while (FindNextFileW(hMark, &mfd));
-            FindClose(hMark);
-        }
-    }
     return files;
 }
 
@@ -2880,7 +3071,7 @@ static void SyncLuaFiles() {
                     continue;
                 }
                 mz_zip_reader_get_filename(&zip, i, fname, sizeof(fname));
-                if (!IsValidLuaFilename(fname) && !IsValidMarkerFilename(fname)) {
+                if (!IsValidLuaFilename(fname)) {
                     LOG("[LuaSync] Skipping invalid zip entry: %s", fname);
                     continue;
                 }
@@ -2929,7 +3120,7 @@ static void SyncLuaFiles() {
     bool manifestChanged = false;
 
     for (auto& [filename, entry] : cloudManifest) {
-        if (!IsValidLuaFilename(filename) && !IsValidMarkerFilename(filename)) {
+        if (!IsValidLuaFilename(filename)) {
             LOG("[LuaSync] Skipping invalid manifest entry: %s", filename.c_str());
             continue;
         }
@@ -2991,9 +3182,7 @@ static void SyncLuaFiles() {
                     uint32_t appId = (uint32_t)strtoul(lf.filename.substr(0, dot).c_str(), nullptr, 10);
                     if (appId) {
                         std::string luaPath = g_steamPath + "config\\stplug-in\\" + lf.filename;
-                        uint32_t acctId = GetAccountId();
-                        if (IsSelfUnlockingLua(luaPath, appId) &&
-                            !IsOwnedMarker(g_steamPath + "config\\stplug-in\\", appId, acctId))
+                        if (IsSelfUnlockingLua(luaPath, appId))
                             AddNamespaceApp(appId);
                     }
                 }
@@ -3181,39 +3370,6 @@ static uint64_t ReadSteamVersion(const std::string& steamDir) {
             else return 0;
         }
         return v;
-    }
-    return 0;
-}
-
-// Read loginusers.vdf to find the MostRecent account before first packet.
-static uint32_t DetectStartupAccountId(const std::string& steamPath) {
-    std::string vdfPath = steamPath + "config\\loginusers.vdf";
-    std::ifstream ifs(FileUtil::Utf8ToPath(vdfPath));
-    if (!ifs.is_open()) return 0;
-    std::string content((std::istreambuf_iterator<char>(ifs)), {});
-    uint64_t candidateId = 0;
-    size_t pos = 0;
-    while (pos < content.size()) {
-        size_t q1 = content.find('"', pos);
-        if (q1 == std::string::npos) break;
-        size_t q2 = content.find('"', q1 + 1);
-        if (q2 == std::string::npos) break;
-        std::string tok = content.substr(q1 + 1, q2 - q1 - 1);
-        pos = q2 + 1;
-        if (tok.size() == 17 && tok.substr(0, 4) == "7656") {
-            bool allDigits = true;
-            for (char c : tok) if (c < '0' || c > '9') { allDigits = false; break; }
-            if (allDigits) { candidateId = strtoull(tok.c_str(), nullptr, 10); continue; }
-        }
-        if (tok == "MostRecent" && candidateId) {
-            size_t vq1 = content.find('"', pos);
-            if (vq1 == std::string::npos) break;
-            size_t vq2 = content.find('"', vq1 + 1);
-            if (vq2 == std::string::npos) break;
-            if (content.substr(vq1 + 1, vq2 - vq1 - 1) == "1")
-                return static_cast<uint32_t>(candidateId & 0xFFFFFFFF);
-            pos = vq2 + 1;
-        }
     }
     return 0;
 }
@@ -3773,8 +3929,6 @@ void Init(const std::string& steamPath) {
     std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
     std::string pluginBase = g_steamPath + "config\\stplug-in\\";
     int totalLuas = 0, selfUnlocking = 0;
-    uint32_t startupAccountId = DetectStartupAccountId(g_steamPath);
-    LOG("[NS] Startup accountId: %u (from loginusers.vdf)", startupAccountId);
     // Wide enumeration; FindFirstFileA fails on non-ASCII g_steamPath.
     auto pluginDirWide = FileUtil::Utf8ToPath(pluginDir).wstring();
     WIN32_FIND_DATAW fd;
@@ -3795,12 +3949,8 @@ void Init(const std::string& steamPath) {
                         totalLuas++;
                         std::string luaPath = pluginBase + name;
                         if (IsSelfUnlockingLua(luaPath, appId)) {
-                            if (IsOwnedMarker(pluginBase, appId, startupAccountId)) {
-                                LOG("[NS] Skipping owned app %u (sentinel present)", appId);
-                            } else {
-                                AddNamespaceApp(appId);
-                                selfUnlocking++;
-                            }
+                            AddNamespaceApp(appId);
+                            selfUnlocking++;
                         }
                     }
                 }
