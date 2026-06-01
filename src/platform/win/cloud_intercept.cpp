@@ -2653,6 +2653,26 @@ static bool IsValidLuaFilename(const std::string& name) {
     return true;
 }
 
+// Matches "<digits>.<digits>" sentinel filenames (e.g., "8870.1531967859").
+static bool IsValidMarkerFilename(const std::string& name) {
+    auto dot = name.rfind('.');
+    if (dot == 0 || dot == std::string::npos || dot == name.size() - 1) return false;
+    if (name.find('.') != dot) return false;
+    for (size_t i = 0; i < dot; ++i)
+        if (name[i] < '0' || name[i] > '9') return false;
+    for (size_t i = dot + 1; i < name.size(); ++i)
+        if (name[i] < '0' || name[i] > '9') return false;
+    return true;
+}
+
+// Check if <pluginBase><appId>.<accountId> sentinel file exists.
+static bool IsOwnedMarker(const std::string& pluginBase, uint32_t appId, uint32_t accountId) {
+    if (!accountId) return false;
+    std::string markerPath = pluginBase + std::to_string(appId) + "." + std::to_string(accountId);
+    DWORD attrs = GetFileAttributesW(FileUtil::Utf8ToPath(markerPath).c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+}
+
 // Reject binary content (NUL bytes in the first 8KB)
 static bool IsValidLuaContent(const uint8_t* data, size_t len) {
     size_t check = (len < 8192) ? len : 8192;
@@ -2697,6 +2717,28 @@ static std::vector<LuaFile> ReadLocalLuaFiles() {
         files.push_back(std::move(lf));
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
+
+    // Scan sentinel files (<digits>.<digits>)
+    {
+        std::wstring markerPattern = dirWide + L"*.*";
+        WIN32_FIND_DATAW mfd;
+        HANDLE hMark = FindFirstFileW(markerPattern.c_str(), &mfd);
+        if (hMark != INVALID_HANDLE_VALUE) {
+            do {
+                std::string name = FileUtil::WideToUtf8(mfd.cFileName);
+                if (name.empty() || !IsValidMarkerFilename(name)) continue;
+                LuaFile lf;
+                lf.filename = name;
+                lf.content = {};
+                ULARGE_INTEGER uli;
+                uli.LowPart  = mfd.ftLastWriteTime.dwLowDateTime;
+                uli.HighPart = mfd.ftLastWriteTime.dwHighDateTime;
+                lf.modTime = (uli.QuadPart - 116444736000000000ULL) / 10000000ULL;
+                files.push_back(std::move(lf));
+            } while (FindNextFileW(hMark, &mfd));
+            FindClose(hMark);
+        }
+    }
     return files;
 }
 
@@ -2838,7 +2880,7 @@ static void SyncLuaFiles() {
                     continue;
                 }
                 mz_zip_reader_get_filename(&zip, i, fname, sizeof(fname));
-                if (!IsValidLuaFilename(fname)) {
+                if (!IsValidLuaFilename(fname) && !IsValidMarkerFilename(fname)) {
                     LOG("[LuaSync] Skipping invalid zip entry: %s", fname);
                     continue;
                 }
@@ -2887,7 +2929,7 @@ static void SyncLuaFiles() {
     bool manifestChanged = false;
 
     for (auto& [filename, entry] : cloudManifest) {
-        if (!IsValidLuaFilename(filename)) {
+        if (!IsValidLuaFilename(filename) && !IsValidMarkerFilename(filename)) {
             LOG("[LuaSync] Skipping invalid manifest entry: %s", filename.c_str());
             continue;
         }
@@ -2949,7 +2991,9 @@ static void SyncLuaFiles() {
                     uint32_t appId = (uint32_t)strtoul(lf.filename.substr(0, dot).c_str(), nullptr, 10);
                     if (appId) {
                         std::string luaPath = g_steamPath + "config\\stplug-in\\" + lf.filename;
-                        if (IsSelfUnlockingLua(luaPath, appId))
+                        uint32_t acctId = GetAccountId();
+                        if (IsSelfUnlockingLua(luaPath, appId) &&
+                            !IsOwnedMarker(g_steamPath + "config\\stplug-in\\", appId, acctId))
                             AddNamespaceApp(appId);
                     }
                 }
@@ -3137,6 +3181,39 @@ static uint64_t ReadSteamVersion(const std::string& steamDir) {
             else return 0;
         }
         return v;
+    }
+    return 0;
+}
+
+// Read loginusers.vdf to find the MostRecent account before first packet.
+static uint32_t DetectStartupAccountId(const std::string& steamPath) {
+    std::string vdfPath = steamPath + "config\\loginusers.vdf";
+    std::ifstream ifs(FileUtil::Utf8ToPath(vdfPath));
+    if (!ifs.is_open()) return 0;
+    std::string content((std::istreambuf_iterator<char>(ifs)), {});
+    uint64_t candidateId = 0;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t q1 = content.find('"', pos);
+        if (q1 == std::string::npos) break;
+        size_t q2 = content.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        std::string tok = content.substr(q1 + 1, q2 - q1 - 1);
+        pos = q2 + 1;
+        if (tok.size() == 17 && tok.substr(0, 4) == "7656") {
+            bool allDigits = true;
+            for (char c : tok) if (c < '0' || c > '9') { allDigits = false; break; }
+            if (allDigits) { candidateId = strtoull(tok.c_str(), nullptr, 10); continue; }
+        }
+        if (tok == "MostRecent" && candidateId) {
+            size_t vq1 = content.find('"', pos);
+            if (vq1 == std::string::npos) break;
+            size_t vq2 = content.find('"', vq1 + 1);
+            if (vq2 == std::string::npos) break;
+            if (content.substr(vq1 + 1, vq2 - vq1 - 1) == "1")
+                return static_cast<uint32_t>(candidateId & 0xFFFFFFFF);
+            pos = vq2 + 1;
+        }
     }
     return 0;
 }
@@ -3696,6 +3773,8 @@ void Init(const std::string& steamPath) {
     std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
     std::string pluginBase = g_steamPath + "config\\stplug-in\\";
     int totalLuas = 0, selfUnlocking = 0;
+    uint32_t startupAccountId = DetectStartupAccountId(g_steamPath);
+    LOG("[NS] Startup accountId: %u (from loginusers.vdf)", startupAccountId);
     // Wide enumeration; FindFirstFileA fails on non-ASCII g_steamPath.
     auto pluginDirWide = FileUtil::Utf8ToPath(pluginDir).wstring();
     WIN32_FIND_DATAW fd;
@@ -3716,8 +3795,12 @@ void Init(const std::string& steamPath) {
                         totalLuas++;
                         std::string luaPath = pluginBase + name;
                         if (IsSelfUnlockingLua(luaPath, appId)) {
-                            AddNamespaceApp(appId);
-                            selfUnlocking++;
+                            if (IsOwnedMarker(pluginBase, appId, startupAccountId)) {
+                                LOG("[NS] Skipping owned app %u (sentinel present)", appId);
+                            } else {
+                                AddNamespaceApp(appId);
+                                selfUnlocking++;
+                            }
                         }
                     }
                 }
