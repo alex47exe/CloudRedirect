@@ -1351,7 +1351,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                 rawFilename.assign(reinterpret_cast<const char*>(f.data), f.dataLen);
         if (!rawFilename.empty()) {
             // Forward to Steam CM; responseBody gets Steam's response with the CDN URL.
-            int sFlags[8] = {};
+            int sFlags[68] = {};
             if (g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags)) {
                 auto sRespBytes = SerializeBodyToBytes(responseBody);
                 auto sRespFields = PB::Parse(sRespBytes.data(), sRespBytes.size());
@@ -1419,17 +1419,17 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                         bool putOk = false;
                         HINTERNET hSession = GetSteamMirrorSession();
                         if (hSession) {
-                            auto wHost = FileUtil::Utf8ToPath(info.host).wstring();
+                            auto wHost = HttpUtil::Widen(info.host);
                             INTERNET_PORT port = info.useHttps ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
                             HINTERNET hConn = WinHttpConnect(hSession, wHost.c_str(), port, 0);
                             if (hConn) {
-                                auto wPath = FileUtil::Utf8ToPath(info.path).wstring();
+                                auto wPath = HttpUtil::Widen(info.path);
                                 DWORD oFlags = info.useHttps ? (WINHTTP_FLAG_SECURE | WINHTTP_FLAG_ESCAPE_DISABLE) : WINHTTP_FLAG_ESCAPE_DISABLE;
                                 HINTERNET hReq = WinHttpOpenRequest(hConn, L"PUT", wPath.c_str(),
                                     nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, oFlags);
                                 if (hReq) {
                                     for (auto& hdr : info.requestHeaders) {
-                                        auto wHdr = FileUtil::Utf8ToPath(hdr).wstring();
+                                        auto wHdr = HttpUtil::Widen(hdr);
                                         WinHttpAddRequestHeaders(hReq, wHdr.c_str(), (DWORD)wHdr.size(), WINHTTP_ADDREQ_FLAG_ADD);
                                     }
                                     BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -1450,7 +1450,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                             }
                         }
                         if (putOk) {
-                            int sFlags[8] = {};
+                            int sFlags[68] = {};
                             g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags);
                             LOG("[SteamMirror] CommitFileUpload forwarded to Steam for app=%u file=%s", realAppId, cleanName.c_str());
                         } else {
@@ -1465,7 +1465,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         // Restore our local response (overwrite Steam's response if CommitFileUpload was forwarded).
     } else if (strcmp(methodName, RPC_DELETE_FILE) == 0) {
         // Forward delete to Steam Cloud as well.
-        int sFlags[8] = {};
+        int sFlags[68] = {};
         if (g_originalSlot4(thisptr, methodName, requestBody, responseBody, sFlags))
             LOG("[SteamMirror] DeleteFile forwarded to Steam for app=%u", realAppId);
         else
