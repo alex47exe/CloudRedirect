@@ -3,12 +3,20 @@
 #include <cstdarg>
 #include <ctime>
 #include <vector>
+#include <unordered_map>
+#include <filesystem>
 
 namespace Log {
 
 static FILE* g_file = nullptr;
 static std::mutex g_mutex;
 static std::string g_logPath;
+
+// Per-app log handles: key is the full UTF-8 path, opened lazily.
+static std::unordered_map<std::string, FILE*> g_appLogs;
+
+// Thread-local path for the current app log (empty = no per-app context).
+static thread_local std::string tl_appLogPath;
 
 static constexpr long MAX_LOG_SIZE = 10 * 1024 * 1024;
 
@@ -86,6 +94,9 @@ void Shutdown() {
         fclose(g_file);
         g_file = nullptr;
     }
+    for (auto& [path, f] : g_appLogs)
+        if (f) fclose(f);
+    g_appLogs.clear();
 }
 
 void Write(const char* fmt, ...) {
@@ -144,6 +155,31 @@ void Write(const char* fmt, ...) {
     size_t total = (size_t)prefix + (size_t)bodyLen;
     buf[total++] = '\n';
     WriteRecord(buf, total);
+
+    // Also write to per-app log if a context is set on this thread.
+    if (!tl_appLogPath.empty()) {
+        auto it = g_appLogs.find(tl_appLogPath);
+        if (it == g_appLogs.end()) {
+            // Ensure directory exists, then open (append).
+            std::error_code ec;
+            auto wDir = FileUtil::Utf8ToPath(tl_appLogPath).parent_path();
+            if (!wDir.empty()) std::filesystem::create_directories(wDir, ec);
+            FILE* af = OpenLog(tl_appLogPath);
+            it = g_appLogs.emplace(tl_appLogPath, af).first;
+        }
+        if (it->second) {
+            fwrite(buf, 1, total, it->second);
+            fflush(it->second);
+        }
+    }
+}
+
+void SetAppContext(const std::string& appLogPath) {
+    tl_appLogPath = appLogPath;
+}
+
+void ClearAppContext() {
+    tl_appLogPath.clear();
 }
 
 } // namespace Log

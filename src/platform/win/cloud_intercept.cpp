@@ -1330,7 +1330,11 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     SpyLogFields("[Slot4-REQ]", reqBytes.data(), (uint32_t)reqBytes.size());
 #endif
 
-    // Capture SteamID from request header if not already cached.
+    // Per-app log: write all log output for this RPC call to the app's own log file.
+    uint32_t slot4AccountId = GetAccountId();
+    std::string slot4AppLogPath = slot4AccountId
+        ? LocalStorage::GetAppPath(slot4AccountId, realAppId) + "cloud_redirect.log" : std::string{};
+    Log::AppScope appLog(slot4AppLogPath);
 
     // Call the appropriate handler to build a response body
     auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
@@ -1602,7 +1606,11 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     SpyLogFields("[VtHook-REQ]", reqBytes.data(), (uint32_t)reqBytes.size());
 #endif
 
-    // Capture SteamID from request header if not yet captured
+    // Per-app log: write all log output for this RPC call to the app's own log file.
+    uint32_t slot5AccountId = GetAccountId();
+    std::string slot5AppLogPath = slot5AccountId
+        ? LocalStorage::GetAppPath(slot5AccountId, realAppId) + "cloud_redirect.log" : std::string{};
+    Log::AppScope appLog(slot5AppLogPath);
     if (g_steamId.load() == 0) {
         void* reqHeader = *(void**)((uintptr_t)request + 40);
         if (reqHeader) {
